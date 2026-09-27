@@ -72,10 +72,10 @@ Three steps: install the package into the profile, add the row to the profile's 
 
 ```sh
 cd ~/.dsh/profiles/web
-pnpm add link:C:/resource/dsh-history-access-dev
+pnpm add link:C:/resource/dsh-history-access
 ```
 
-A `link:` dependency resolves to the real directory, so the host runs the files in that tree. A **new** dependency is read at startup, so the host needs one restart after this step; the row below cannot resolve in a running process.
+A `link:` dependency resolves to the real directory, so the host runs the files in that tree. Install the stable checkout, not a development worktree. A **new** dependency is normally read at startup, so a restart is the safe expectation; on a host that resolved the profile live, adding the row after the install loaded it without one.
 
 ### 2. Wire the row
 
@@ -107,11 +107,11 @@ To edit the plugin while the host runs, list the files (not the directory) in th
   config:
     base: 'file:///C:/resource'
     root:
-      - 'C:/resource/dsh-history-access-dev/index.js'
-      - 'C:/resource/dsh-history-access-dev/lib/config.js'
-      - 'C:/resource/dsh-history-access-dev/lib/render.js'
-      - 'C:/resource/dsh-history-access-dev/lib/query.js'
-      - 'C:/resource/dsh-history-access-dev/lib/pointer.js'
+      - 'C:/resource/dsh-history-access/index.js'
+      - 'C:/resource/dsh-history-access/lib/config.js'
+      - 'C:/resource/dsh-history-access/lib/render.js'
+      - 'C:/resource/dsh-history-access/lib/query.js'
+      - 'C:/resource/dsh-history-access/lib/pointer.js'
 ```
 
 `base` accepts a relative path or a `file://` URL (an absolute drive path parses as a URL scheme and fails activation), and it must be an ancestor of every root. A reload disposes the plugin and imports it again, so `apply()` re-runs; registrations ride the fiber, so nothing is duplicated.
