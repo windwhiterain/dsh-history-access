@@ -740,6 +740,11 @@ await test('a completed compaction delivers exactly one pointer naming the check
   const end = { type: 'compaction/end', seq: 22, data: { compactionId: 'cmp-1', turn: null } }
   listener(session, summary)
   listener(session, end)
+  // `session/event` is dispatched inside `Session.append()`, whose append lock
+  // is still held; splicing the inbox synchronously would be refused with
+  // "session append cannot reenter while another append is being published".
+  assert.equal(h.injected.length, 0, 'delivery is deferred past the publishing append')
+  await Promise.resolve()
   assert.equal(h.injected.length, 1)
   const message = h.injected[0]
   assert.equal(message.role, 'user')
@@ -752,6 +757,7 @@ await test('a completed compaction delivers exactly one pointer naming the check
   assert.match(text, /do not read or decompress session files/)
   listener(session, summary)
   listener(session, end)
+  await Promise.resolve()
   assert.equal(h.injected.length, 1, 'a repeated pass is deduped')
 })
 
@@ -764,6 +770,7 @@ await test('a failed compaction pass delivers no pointer and leaves the next pas
   assert.equal(h.injected.length, 0)
   listener(session, { type: 'compaction/summary', seq: 30, data: { compactionId: 'cmp-9', shadowedSeqs: [4, 5], shadowedTokenCount: 20 } })
   listener(session, { type: 'compaction/end', seq: 32, data: { compactionId: 'cmp-9' } })
+  await Promise.resolve()
   assert.equal(h.injected.length, 1, 'a later completed pass with the same id still delivers once')
 })
 
@@ -787,6 +794,7 @@ await test('an unavailable agent and a throwing injection never escape the liste
   const failing = throwing.listeners.get('session/event')[0]
   failing({ id: SESSION_ID }, { type: 'compaction/summary', seq: 20, data: { compactionId: 'cmp-1', shadowedSeqs: [4], shadowedTokenCount: 1 } })
   failing({ id: SESSION_ID }, { type: 'compaction/end', seq: 22, data: { compactionId: 'cmp-1' } })
+  await Promise.resolve()
   assert.equal(throwing.warnings.length, 1)
   assert.match(throwing.warnings[0], /the post-compaction pointer was not delivered: Error: agent disposed/)
 })

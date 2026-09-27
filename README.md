@@ -60,6 +60,10 @@ The originals are still recorded in this session — call history_read (checkpoi
 
 Delivery is deduped per `compactionId`, so one completed pass produces one pointer even if the event feed repeats; a failed pass (`compaction/end` carrying `error`) produces none; and a session with no live agent is skipped. The listener never throws into the host: a disposed agent's rejection is logged and dropped. The message carries `source: { kind: 'history-access' }` and appears in the session log like any other injected context.
 
+Delivery is deferred by one microtask past the publishing append. A `session/event` listener runs inside `Session.append()`, whose append lock is still held, so splicing the inbox synchronously is refused with `session append cannot reenter while another append is being published`; the pass is recorded as delivered only once the splice succeeded, so a failed delivery is retried by the same pass's next `compaction/end`.
+
+The pointer costs roughly 40 tokens of context per completed pass, and only while `pointer: inject` is set.
+
 ## Install and wiring
 
 Three steps: install the package into the profile, add the row to the profile's live patch layer, and (when developing the plugin) add the source files to `hmr.root`.
@@ -118,15 +122,23 @@ To edit the plugin while the host runs, list the files (not the directory) in th
 node probe/probe.mjs
 ```
 
-The probe needs no host and no dependency. It drives `apply()` against an in-memory fake `ctx` and a fake `sessionQuery` serving a synthetic log with four turns, an assistant message carrying a tool call, matching tool results, two compaction checkpoints where the second supersedes the first, and the replacement `user/message` events carrying `surfaceOp: { op: 'replace', … }`. 36 probes pass, covering registration, the outline, transcript pagination (a working cursor with no duplicated or skipped event), explicit truncation and every page's character budget, literal search that names the owning checkpoint, the executing-step exclusion, every rejection path, configuration validation, service-failure translation, exact cancellation, and the pointer's text, dedupe, and failure containment.
+The probe needs no host and no dependency. It drives `apply()` against an in-memory fake `ctx` and a fake `sessionQuery` serving a synthetic log with four turns, an assistant message carrying a tool call, matching tool results, two compaction checkpoints where the second supersedes the first, and the replacement `user/message` events carrying `surfaceOp: { op: 'replace', … }`. 36 probes pass, covering registration, the outline, transcript pagination (a working cursor with no duplicated or skipped event), explicit truncation and every page's character budget, literal search that names the owning checkpoint, the executing-step exclusion, every rejection path, configuration validation, service-failure translation, exact cancellation, and the pointer's text, dedupe, deferral, and failure containment.
+
+A second, read-only probe reports what a real session log proves, for acceptance runs against a live host:
+
+```sh
+node probe/session-inspect.mjs <session-log|sessions-root> [limit]
+```
+
+It decodes the zstd-framed log and prints, per session, whether the request header carries the three tools, every compaction pass with the span it shadowed, every pointer this plugin injected, and every call the tools received with its result size.
 
 ## Known Limitations
 
 - **Recall is a learned behavior.** Untrained models under-use any new tool, and this plugin ships no system-prompt section, so the tool descriptions are the entire teaching surface. Expect misses that are the model's choice, not a read failure.
 - **Literal search only.** `history_search` is a case-insensitive literal phrase match (words may match across whitespace). No regex, no fuzzy match, no semantic search. It also inherits the harness's text extraction: reasoning blocks and `system`/`developer` messages contribute no searchable text, so a phrase that appears only there is not findable — read the span with `history_read` instead.
 - **Single-session scope.** Only the calling agent's own session is reachable. Parent, child, and sibling sessions are out of scope, and there is no cross-session search.
-- **The pointer arrives on the following step, not the request that carries the summary.** The pointer is staged at `compaction/end` with `Agent.inject`, and injected context is claimed at the next step boundary. A pass that runs at the end of a turn therefore delivers the pointer at the next turn's first request, and `inject` never wakes an idle agent, so a session that stays idle sees it only when something else wakes it. This delivery point was derived from the source (`packages/core/agent-loop/src/agent.ts`: the inbox is claimed before the `agent/pre-step` waterfall, which is where automatic compaction runs) and has **not** been observed in a running host.
-- **The injection channel is unverified against a live host.** `Agent.inject` and the `session/event` feed were read from source, not exercised end to end. In particular, this plugin has not confirmed in a real session log that an injected message with an unknown `source.kind` string (`history-access`) is accepted by the durable reader; the reader's contract requires only a non-empty kind other than `'plugin'` and preserves unknown kinds, so this is expected to hold.
+- **The pointer arrives on the following step, not the request that carries the summary.** The pointer is staged at `compaction/end` with `Agent.inject`, and injected context is claimed at the next step boundary. A pass that runs at the end of a turn therefore delivers the pointer at the next turn's first request, and `inject` never wakes an idle agent, so a session that stays idle sees it only when something else wakes it. This was observed in a one-shot host run: every completed pass delivered its pointer to the next step, and the model then read the condensed span with `history_read`.
+- **Injected attribution is admitted by the format reader and was observed in a real log.** The V4 admission rule (`packages/session/session-format-v3-to-v4/src/message-sources.ts`) requires a non-empty `source.kind` other than the retired `'plugin'`, which an out-of-tree plugin cannot use; `'history-access'` satisfies it. A `--session-id` resume of a session carrying 20 delivered pointers passed the query service's replay validation before driving its task.
 - **A superseded checkpoint's own node renders at its own log position.** Transcript events are ordered by raw seq. When one compaction replaced an earlier checkpoint's replacement node, that node's text (the earlier summary) appears where its seq falls rather than at the head of the restored span. The text is complete; only the ordering differs from what the model originally saw.
 - **`outlineMaxChars` can be exceeded by the checkpoint list.** The list is kept complete on purpose — a checkpoint a model cannot see is one it cannot read — so only turn detail is elided.
 - **Every read goes through `ctx.sessionQuery`.** Without that service mounted, all three tools fail with a model-safe message. The plugin itself performs no I/O; the service may load a persisted log for a session that is not live, which for the intended caller (its own live session) does not arise.

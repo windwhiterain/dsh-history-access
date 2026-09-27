@@ -426,19 +426,27 @@ function pointerListener(ctx, dedupe) {
     if (typeof compactionId !== 'string' || !dedupe.shouldDeliver(compactionId)) return
     const agent = ctx.get('agents')?.get(session.id)
     if (agent === undefined) return
-    dedupe.markDelivered(compactionId)
-    try {
-      agent.inject({
-        id: `history-access:${compactionId}`,
-        role: 'user',
-        content: [{ type: 'text', text: pointerText(checkpoint) }],
-        source: { kind: 'history-access' },
-      })
-    } catch (error) {
-      // A disposed agent has no inbox; the pointer is dropped rather than
-      // surfaced, because nothing in the host awaits this listener's work.
-      ctx.logger?.warn?.(`history-access: the post-compaction pointer was not delivered: ${String(error)}`)
-    }
+    // This listener runs inside `Session.append()`, whose append lock is still
+    // held, so splicing the inbox here would reenter the log and be refused
+    // ("session append cannot reenter while another append is being published").
+    // Delivery is deferred past the publishing append, and the pass is recorded
+    // as delivered only once the splice succeeded, so a failed delivery is
+    // retried by the next `compaction/end` for the same pass.
+    queueMicrotask(() => {
+      try {
+        agent.inject({
+          id: `history-access:${compactionId}`,
+          role: 'user',
+          content: [{ type: 'text', text: pointerText(checkpoint) }],
+          source: { kind: 'history-access' },
+        })
+        dedupe.markDelivered(compactionId)
+      } catch (error) {
+        // A disposed agent has no inbox; the pointer is dropped rather than
+        // surfaced, because nothing in the host awaits this listener's work.
+        ctx.logger?.warn?.(`history-access: the post-compaction pointer was not delivered: ${String(error)}`)
+      }
+    })
   }
 }
 
