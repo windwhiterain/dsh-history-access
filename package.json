@@ -1,0 +1,35 @@
+{
+  "name": "dsh-history-access",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent-facing recall of a session's own pre-compaction history for DeepSeek Harness: an outline, a paginated transcript read, and a literal search over the durable log.",
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "cordis",
+    "plugin",
+    "compaction",
+    "history"
+  ],
+  "license": "MIT",
+  "author": "windwhiterain",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/windwhiterain/dsh-history-access.git"
+  },
+  "homepage": "https://github.com/windwhiterain/dsh-history-access#readme",
+  "exports": {
+    ".": "./index.js",
+    "./lib/render": "./lib/render.js",
+    "./lib/query": "./lib/query.js",
+    "./lib/config": "./lib/config.js",
+    "./lib/pointer": "./lib/pointer.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "lib/*.js",
+    "README.md"
+  ]
+}
