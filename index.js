@@ -15,6 +15,29 @@
  * reaches the model through the documented injection channel
  * (`Agent.inject`, `packages/core/agent/src/runtime-types.ts`).
  *
+ * The three tools are registered LAZILY, so a session that has condensed
+ * nothing spends no schema tokens on recall it cannot use. Registration lands
+ * in the calling agent's own scope (`agent.ctx.tools.register`) at the moment
+ * the need appears:
+ *
+ * - on a successful `compaction/end`, and
+ * - at `agent/created` for a session that already carries checkpoints — a
+ *   resume, whose earlier condensation this plugin never saw.
+ *
+ * A mid-session tool addition is first-class here rather than a workaround: the
+ * loop logs a `request/header` for the new set plus a `developer/message`
+ * carrying `tool-addition` blocks, and the next step's request presents the
+ * schema (`packages/core/agent-loop/src/agent.ts` `buildRequest`). Automatic
+ * compaction runs inside the `agent/pre-step` waterfall or on
+ * `agent/request-error`, both ahead of the next `assemble()`
+ * (`packages/compaction/compaction-basic/src/index.ts`), so the tools are
+ * visible from the step after the one that condensed. The step that requested
+ * the compaction itself still runs with the old schema.
+ *
+ * The agent's own layer is exempt from `tools.restrict()` and unwinds with the
+ * agent's fiber, so a preset that masks a global tool cannot strip recall, and
+ * nothing needs explicit teardown.
+ *
  * @module dsh-history-access
  */
 
@@ -27,9 +50,6 @@ export { Config }
 
 /** Cordis plugin name. */
 export const name = 'history-access'
-
-/** Services this plugin cannot register its tools without. */
-export const inject = ['tools']
 
 /** Fibers this module has already applied to, so a repeated `apply` is a no-op. */
 const applied = new WeakSet()
@@ -388,6 +408,98 @@ function searchDefinition(ctx, config, query) {
 }
 
 /**
+ * Build the recall tools against the context whose scope they will serve.
+ *
+ * A definition is built per registering agent, not once per plugin, because
+ * `history_read`'s step boundary is resolved through that agent's own context.
+ * @param ctx - the registering agent's context.
+ * @param config - the normalized row configuration.
+ * @param query - the shared read facade.
+ * @returns the three definitions, in canonical order.
+ */
+function recallTools(ctx, config, query) {
+  return [
+    outlineDefinition(config, query),
+    readDefinition(ctx, config, query),
+    searchDefinition(ctx, config, query),
+  ]
+}
+
+/**
+ * Register the three tools into one agent's own scope, once.
+ *
+ * Ownership rides the agent's fiber, so disposal and HMR unwind the
+ * registration with no bookkeeping here. The visible-set check makes the
+ * operation idempotent: re-registering a name already present in this scope
+ * would throw (`packages/core/scope/src/store.ts` `NamedEntries.insert`), and a
+ * second compaction pass, a repeated `agent/created`, or a reload must not.
+ * @param ctx - the plugin context, for diagnostics and the read facade.
+ * @param config - the normalized row configuration.
+ * @param query - the shared read facade.
+ * @param agent - the agent whose scope receives the tools.
+ */
+function registerRecallTools(ctx, config, query, agent) {
+  const tools = agent.ctx?.tools
+  if (tools === undefined) {
+    // The deployment mounts no tool registry; there is nothing to register into
+    // and nothing this listener can do about it, so the pass is dropped quietly.
+    ctx.logger?.warn?.('history-access: no tool registry is mounted, so the recall tools stay unregistered')
+    return
+  }
+  for (const definition of recallTools(agent.ctx, config, query)) {
+    if (tools.get(definition.name, agent) !== undefined) continue
+    tools.register(definition)
+  }
+}
+
+/**
+ * Find a checkpoint sequence to name the pointer of a session this plugin
+ * joined late.
+ *
+ * The live log is indexed by log position, and `SessionSeq` is that position
+ * (`packages/core/session/src/index.ts` `append`), so a summary event's index is
+ * the seq the `c<summarySeq>` checkpoint id is built from.
+ * @param session - the session to inspect.
+ * @returns the first recorded checkpoint's seq, or undefined when it has none.
+ */
+function firstCheckpointSeq(session) {
+  const events = session.snapshotEvents?.()
+  if (!Array.isArray(events)) return undefined
+  for (const [index, event] of events.entries()) {
+    if (event.type !== 'compaction/summary') continue
+    if (Number.isInteger(event.seq)) return event.seq
+    return index
+  }
+  return undefined
+}
+
+/**
+ * Register the recall tools at agent creation when the session already carries
+ * condensation this plugin never saw.
+ *
+ * A resume starts from a log whose earlier turns were already replaced by
+ * checkpoints, so waiting for the next compaction would leave recall
+ * unavailable for a session that may never compact again. The check reads the
+ * live log this plugin already holds — one pass over the in-memory event list,
+ * no service call — and a resumed session has already paid to load that log.
+ * @param ctx - the plugin context.
+ * @param config - the normalized row configuration.
+ * @param query - the shared read facade.
+ * @returns the `agent/created` listener.
+ */
+function creationListener(ctx, config, query) {
+  return ({ agent }) => {
+    if (agent?.session === undefined) return
+    if (firstCheckpointSeq(agent.session) === undefined) return
+    try {
+      registerRecallTools(ctx, config, query, agent)
+    } catch (error) {
+      ctx.logger?.warn?.(`history-access: the recall tools were not registered: ${String(error)}`)
+    }
+  }
+}
+
+/**
  * Build the post-compaction pointer listener.
  *
  * A compaction pass records its summary while it is still running, so the
@@ -395,11 +507,19 @@ function searchDefinition(ctx, config, query) {
  * when the matching `compaction/end` reports success. Delivery goes through
  * `Agent.inject`, which stages durable context for the next pre-step without
  * waking an idle agent; a failed or repeated pass delivers nothing.
+ *
+ * The listener also arms the recall tools. That half runs synchronously, while
+ * the publishing append's lock is still held, because registering a tool only
+ * mutates a registry layer and the next `assemble()` needs it; splicing an
+ * inbox, which the host refuses under that lock, is deferred separately below.
+ * A pass that reported an `error` condensed nothing and arms nothing.
  * @param ctx - the plugin context.
- * @param dedupe - the per-compaction delivery policy.
+ * @param config - the normalized row configuration.
+ * @param query - the shared read facade.
+ * @param dedupe - the per-compaction pointer delivery policy.
  * @returns the `session/event` listener.
  */
-function pointerListener(ctx, dedupe) {
+function pointerListener(ctx, config, query, dedupe) {
   /** Session id -> compaction id -> the completed checkpoint's pointer facts. */
   const pending = new Map()
   return (session, event) => {
@@ -423,8 +543,19 @@ function pointerListener(ctx, dedupe) {
     // A pass that reported an error condensed nothing, and a pass this plugin
     // joined after its summary has no pointer facts.
     if (event.data?.error !== undefined || checkpoint === undefined) return
-    if (typeof compactionId !== 'string' || !dedupe.shouldDeliver(compactionId)) return
     const agent = ctx.get('agents')?.get(session.id)
+    // Arming is per session, not per pass, and the registration is idempotent:
+    // a session that already registered keeps its tools across every later
+    // checkpoint.
+    if (agent !== undefined) {
+      try {
+        registerRecallTools(ctx, config, query, agent)
+      } catch (error) {
+        ctx.logger?.warn?.(`history-access: the recall tools were not registered: ${String(error)}`)
+      }
+    }
+    if (config.pointer !== 'inject') return
+    if (typeof compactionId !== 'string' || !dedupe.shouldDeliver(compactionId)) return
     if (agent === undefined) return
     // This listener runs inside `Session.append()`, whose append lock is still
     // held, so splicing the inbox here would reenter the log and be refused
@@ -451,8 +582,13 @@ function pointerListener(ctx, dedupe) {
 }
 
 /**
- * Mount this plugin's three tools and its post-compaction pointer.
- * @param ctx - the plugin context carrying the `tools` service.
+ * Mount this plugin's lazy tool registration and its post-compaction pointer.
+ *
+ * Nothing is registered at apply time: a session that has condensed nothing
+ * pays no schema tokens for recall it cannot use. See the module comment for
+ * the two moments that do register, and why a mid-session addition is carried
+ * by the loop rather than special-cased here.
+ * @param ctx - the plugin context.
  * @param rawConfig - the row's configuration, validated here and by {@link Config}.
  */
 export async function apply(ctx, rawConfig) {
@@ -461,16 +597,9 @@ export async function apply(ctx, rawConfig) {
   applied.add(owner)
   const config = normalizeConfig(rawConfig)
   const query = createQuery(ctx)
-  const definitions = [
-    outlineDefinition(config, query),
-    readDefinition(ctx, config, query),
-    searchDefinition(ctx, config, query),
-  ]
-  for (const definition of definitions) {
-    ctx.effect(() => ctx.tools.register(definition), `history-access.${definition.name}`)
-  }
-  if (config.pointer === 'inject') {
-    const dedupe = createPointerDedupe()
-    ctx.on('session/event', pointerListener(ctx, dedupe))
-  }
+  // Global listeners: this plugin is commonly mounted once at the root, and a
+  // row placed inside a preset's plugin list would otherwise see only that
+  // preset's agents — missing every session it is supposed to serve.
+  ctx.on('agent/created', creationListener(ctx, config, query), { global: true })
+  ctx.on('session/event', pointerListener(ctx, config, query, createPointerDedupe()), { global: true })
 }

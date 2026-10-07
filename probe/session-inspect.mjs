@@ -4,7 +4,10 @@
  * Decodes one zstd-framed session log (or the newest logs under a sessions
  * root) and reports the evidence that matters for recall: the compaction
  * passes, the pointer each pass injected, the calls this plugin's tools
- * received, and the tool count of the last request header.
+ * received, and the first request header that offered the history tools.
+ *
+ * The tools are registered lazily, so a session that condensed nothing never
+ * offers them and the first offering header is exactly the arming moment.
  *
  * Usage: node probe/session-inspect.mjs <session-log|sessions-root> [limit]
  */
@@ -95,6 +98,7 @@ function inspect(path) {
   const injections = []
   const calls = []
   let toolNames = []
+  let armedAt
 
   for (const record of all) {
     const event = record.event ?? record
@@ -107,6 +111,11 @@ function inspect(path) {
         .map(tool => tool?.name ?? tool?.function?.name)
         .filter(name => typeof name === 'string')
       if (names.length > 0) toolNames = names
+      // The arming moment: the first header that offers a history tool. A
+      // session that never condenses keeps offering none.
+      if (armedAt === undefined && TOOL_NAMES.some(name => names.includes(name))) {
+        armedAt = { seq: event.seq, reason: event.data?.reason ?? '?' }
+      }
     }
     if (type === 'compaction/start') {
       passes.set(event.data?.compactionId, { started: true, finished: false, error: undefined })
@@ -156,7 +165,7 @@ function inspect(path) {
   }
 
   const histogram = [...counts.entries()].sort((left, right) => right[1] - left[1])
-  return { path, total: all.length, histogram, passes: [...passes.values()], pointers, injections, calls, toolNames }
+  return { path, total: all.length, histogram, passes: [...passes.values()], pointers, injections, calls, toolNames, armedAt }
 }
 
 const target = process.argv[2]
@@ -170,7 +179,7 @@ const paths = isDirectory ? logsUnder(target).slice(0, Number(process.argv[3] ??
 for (const path of paths) {
   const report = inspect(path)
   console.log(`\n== ${report.path}`)
-  console.log(`events=${report.total}  requestHeaderTools=${report.toolNames.length}  historyTools=${TOOL_NAMES.filter(name => report.toolNames.includes(name)).join(',') || '(none)'}`)
+  console.log(`events=${report.total}  requestHeaderTools=${report.toolNames.length}  historyTools=${TOOL_NAMES.filter(name => report.toolNames.includes(name)).join(',') || '(none)'}  armedAt=${report.armedAt === undefined ? '(never)' : `seq ${report.armedAt.seq} (${report.armedAt.reason})`}`)
   console.log(`types: ${report.histogram.slice(0, 12).map(([type, count]) => `${type}=${count}`).join(' ')}`)
   for (const [index, pass] of report.passes.entries()) {
     console.log(`compaction[${index}] summarySeq=${pass.seq} shadowed=${pass.shadowed} shadowedTokens=${pass.shadowedTokens} finished=${pass.finished} error=${pass.error ?? 'none'}`)

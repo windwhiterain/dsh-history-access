@@ -311,7 +311,14 @@ function fakeSessionQuery(events, windowMax) {
 
 /**
  * Build one fake Cordis context around the plugin's real entry point.
- * @param options - the service overrides and the calling agent's step boundary.
+ *
+ * Tool definitions are registered through the AGENT's own context, exactly as
+ * `lib/`-level plugin code must: the plugin arms an agent's scope, never the
+ * module scope. Both the fake root and the fake agent therefore expose a
+ * `tools` service over one shared set of registered names, and `get` answers a
+ * visibility question the way the real registry does (scoped first, then the
+ * inherited global layer).
+ * @param options - the service overrides, the calling agent's step boundary, and any pre-registered names.
  * @returns the context, its captured state, and the registered tool definitions.
  */
 function fakeContext(options = {}) {
@@ -322,15 +329,38 @@ function fakeContext(options = {}) {
   const injected = []
   const warnings = []
   const stepStartSeq = options.stepStartSeq === undefined ? CURRENT_STEP_SEQ : options.stepStartSeq
+  const visible = new Set(options.visible ?? [])
+  const disposers = new Map()
+  const toolRuntime = {
+    register(definition) {
+      if (visible.has(definition.name)) throw new Error(`duplicate tool name "${definition.name}"`)
+      visible.add(definition.name)
+      registered.push(definition)
+      const dispose = () => {
+        visible.delete(definition.name)
+        disposed.push(definition.name)
+      }
+      disposers.set(definition.name, dispose)
+      return dispose
+    },
+    get(name) {
+      return visible.has(name) ? registered.find(entry => entry.name === name) : undefined
+    },
+  }
+  function get(name) {
+    if (name === 'sessionQuery') return options.service
+    if (name === 'agents') return options.agents
+    if (name === 'sessionProjections') {
+      return {
+        stateOf: (_session, key) => key === 'turnBoundary' ? { lastStepStartSeq: stepStartSeq } : undefined,
+      }
+    }
+    return undefined
+  }
   const ctx = {
     fiber: { label: 'probe' },
     logger: { warn: message => warnings.push(String(message)) },
-    tools: {
-      register(definition) {
-        registered.push(definition)
-        return () => disposed.push(definition.name)
-      },
-    },
+    tools: toolRuntime,
     effect(run, label) {
       const dispose = run()
       effects.push({ label, dispose })
@@ -340,24 +370,26 @@ function fakeContext(options = {}) {
       listeners.set(name, [...(listeners.get(name) ?? []), listener])
       return () => {}
     },
-    get(name) {
-      if (name === 'sessionQuery') return options.service
-      if (name === 'agents') return options.agents
-      if (name === 'sessionProjections') {
-        return {
-          stateOf: (_session, key) => key === 'turnBoundary' ? { lastStepStartSeq: stepStartSeq } : undefined,
-        }
-      }
-      return undefined
-    },
+    get,
   }
-  return { ctx, registered, listeners, disposed, injected, warnings, effects }
+  if (options.agent !== undefined) options.agent.ctx = { tools: toolRuntime, get }
+  return { ctx, registered, visible, disposers, listeners, disposed, injected, warnings, effects }
 }
 
-/** The calling agent identity every probe executes as. */
-function callerAgent(injected) {
+/**
+ * The calling agent identity every probe executes as.
+ * @param injected - the sink an `Agent.inject` call lands in.
+ * @param checkpoints - `compaction/summary` seqs the agent's session already carries.
+ * @returns the fake agent, whose `ctx` the fake context fills in.
+ */
+function callerAgent(injected, checkpoints = []) {
   return {
-    session: { id: SESSION_ID, header: { id: SESSION_ID, cwd: 'C:/probe' } },
+    session: {
+      id: SESSION_ID,
+      header: { id: SESSION_ID, cwd: 'C:/probe' },
+      snapshotEvents: () => checkpoints.map(seq => ({ type: 'compaction/summary', seq })),
+    },
+    ctx: undefined,
     inject: message => injected.push(message),
   }
 }
@@ -372,19 +404,38 @@ async function invoke(registered, name, args, exec) {
   return content[0].text
 }
 
-/** Apply the plugin to one fake context and return its execution helpers. */
+/**
+ * Apply the plugin to one fake context and return its execution helpers.
+ *
+ * Tools are no longer registered by `apply()` itself, so unless a probe asks
+ * otherwise the calling agent is created once (`agent/created`) to arm them —
+ * the same path a live host takes. `resumed: false` with `create: false` is the
+ * un-armed baseline a lazy-registration probe asserts on.
+ * @param options - the fake-context options plus `create` and `resumed`.
+ * @returns the fake context, its captured state, and the calling helpers.
+ */
 async function harness(options = {}) {
   const service = options.noService === true
     ? undefined
     : options.service ?? fakeSessionQuery(LOG, options.windowMax ?? 50)
   const injected = []
-  const fake = fakeContext({ ...options, service, agents: { get: () => callerAgent(injected) } })
+  const agent = callerAgent(injected, options.resumed === false ? [] : [20])
+  const fake = fakeContext({
+    ...options,
+    service,
+    agent,
+    agents: { get: () => agent },
+  })
   await apply(fake.ctx, options.config)
+  if (options.create !== false) {
+    for (const listener of fake.listeners.get('agent/created') ?? []) listener({ agent, source: 'startup' })
+  }
   const signal = new AbortController().signal
-  const exec = { agent: callerAgent(injected), signal, callId: 'call', name: 'history_read', arguments: {} }
+  const exec = { agent, signal, callId: 'call', name: 'history_read', arguments: {} }
   return {
     ...fake,
     service,
+    agent,
     injected,
     exec,
     call: (name, args) => invoke(fake.registered, name, args, exec),
@@ -397,16 +448,109 @@ function seqsIn(text) {
 }
 
 // ---------------------------------------------------------------------------
-// Tool registration
+// Lazy tool registration
 // ---------------------------------------------------------------------------
 
-await test('registers exactly the three recall tools under their model-visible names', async () => {
-  const h = await harness()
-  assert.deepEqual(h.registered.map(definition => definition.name), ['history_outline', 'history_read', 'history_search'])
+/** The three model-visible tool names this plugin owns. */
+const TOOL_NAMES = Object.freeze(['history_outline', 'history_read', 'history_search'])
+
+/**
+ * Apply the plugin to a fresh fake context without arming anything.
+ * @param options - the plugin config row and the fake-context options.
+ * @returns the fake context and the injected-message sink.
+ */
+async function unarmed(options = {}) {
+  const injected = []
+  const agent = callerAgent(injected, options.checkpoints ?? [])
+  const fake = fakeContext({
+    ...options,
+    service: fakeSessionQuery(LOG, options.windowMax ?? 50),
+    agent,
+    agents: { get: () => agent },
+  })
+  await apply(fake.ctx, options.config)
+  return { ...fake, agent, injected }
+}
+
+/** Deliver one completed compaction pass to the plugin's session listener. */
+function compact(fake, { compactionId = 'cmp-1', seq = 20, error } = {}) {
+  const listener = fake.listeners.get('session/event')[0]
+  listener({ id: SESSION_ID }, {
+    type: 'compaction/summary',
+    seq,
+    data: { compactionId, shadowedSeqs: [4, 5, 6, 7], shadowedTokenCount: 4812 },
+  })
+  listener({ id: SESSION_ID }, {
+    type: 'compaction/end',
+    seq: seq + 2,
+    data: { compactionId, turn: null, ...error === undefined ? {} : { error } },
+  })
+}
+
+/** Create the fake agent through the plugin's `agent/created` listener. */
+function create(fake) {
+  for (const listener of fake.listeners.get('agent/created') ?? []) listener({ agent: fake.agent, source: 'startup' })
+}
+
+await test('apply() registers no tools, so a session that condensed nothing pays no schema tokens', async () => {
+  const fake = await unarmed()
+  assert.deepEqual(fake.registered, [])
+  assert.equal(fake.listeners.get('agent/created').length, 1)
+  assert.equal(fake.listeners.get('session/event').length, 1)
+})
+
+await test('creating a session with no checkpoint registers nothing', async () => {
+  const fake = await unarmed()
+  create(fake)
+  assert.deepEqual(fake.registered, [])
+})
+
+await test('a completed compaction arms exactly the three recall tools in the agent scope', async () => {
+  const fake = await unarmed()
+  compact(fake)
+  assert.deepEqual(fake.registered.map(definition => definition.name), TOOL_NAMES)
+  assert.equal(fake.listeners.get('session/event').length, 1)
+})
+
+await test('a failed compaction pass arms nothing and leaves the next pass free to arm', async () => {
+  const fake = await unarmed()
+  compact(fake, { error: 'summarize failed' })
+  assert.deepEqual(fake.registered, [])
+  compact(fake)
+  assert.deepEqual(fake.registered.map(definition => definition.name), TOOL_NAMES)
+})
+
+await test('later compaction passes do not register a second copy', async () => {
+  const fake = await unarmed()
+  compact(fake)
+  compact(fake, { compactionId: 'cmp-2', seq: 30 })
+  assert.deepEqual(fake.registered.map(definition => definition.name), TOOL_NAMES)
+  assert.equal(fake.visible.size, 3)
+})
+
+await test('creating an agent whose session already carries a checkpoint arms the tools', async () => {
+  const fake = await unarmed({ checkpoints: [20] })
+  assert.deepEqual(fake.registered, [])
+  create(fake)
+  assert.deepEqual(fake.registered.map(definition => definition.name), TOOL_NAMES)
+})
+
+await test('a compaction pass with no live agent arms nothing and does not throw', async () => {
+  const injected = []
+  const fake = fakeContext({
+    service: fakeSessionQuery(LOG, 50),
+    agents: { get: () => undefined },
+  })
+  await apply(fake.ctx, {})
+  compact(fake)
+  assert.deepEqual(fake.registered, [])
+  assert.deepEqual(fake.warnings, [])
+  assert.equal(injected.length, 0)
 })
 
 await test('every tool declares a raw JSON Schema and an object-rooted output', async () => {
   const h = await harness()
+  assert.deepEqual(h.registered.map(definition => definition.name), TOOL_NAMES)
   for (const definition of h.registered) {
     assert.equal(typeof definition.description, 'string')
     assert.ok(definition.description.length > 80, `${definition.name} describes itself`)
@@ -427,24 +571,25 @@ await test('history_outline takes no arguments and history_search requires a que
   assert.deepEqual(Object.keys(search.parameters.properties), ['query', 'checkpoint', 'limit'])
 })
 
-await test('registration and the pointer listener are effect-based, so a dispose unregisters them', async () => {
+await test('the agent scope owns the registration, and unwinding it removes only its own three tools', async () => {
   const h = await harness()
-  assert.equal(h.effects.length, 3)
-  assert.deepEqual(h.effects.map(effect => effect.label), [
-    'history-access.history_outline',
-    'history-access.history_read',
-    'history-access.history_search',
-  ])
-  for (const effect of h.effects) effect.dispose()
-  assert.deepEqual(h.disposed, ['history_outline', 'history_read', 'history_search'])
-  assert.equal(h.listeners.get('session/event').length, 1)
+  const other = await harness()
+  assert.deepEqual(h.registered.map(definition => definition.name), TOOL_NAMES)
+  for (const definition of h.registered) {
+    const disposer = h.disposers.get(definition.name)
+    assert.equal(typeof disposer, 'function', `${definition.name} registration returned its own disposer`)
+    disposer()
+  }
+  assert.equal(h.visible.size, 0)
+  assert.deepEqual([...h.disposed].sort(), [...TOOL_NAMES].sort())
+  assert.equal(other.visible.size, 3, 'another agent scope keeps its own tools')
 })
 
 await test('apply() is idempotent on the same fiber', async () => {
-  const fake = fakeContext({ service: fakeSessionQuery(LOG, 50), agents: { get: () => undefined } })
+  const fake = await unarmed()
   await apply(fake.ctx, {})
-  await apply(fake.ctx, {})
-  assert.deepEqual(fake.registered.map(definition => definition.name), ['history_outline', 'history_read', 'history_search'])
+  assert.equal(fake.listeners.get('agent/created').length, 1)
+  assert.equal(fake.listeners.get('session/event').length, 1)
 })
 
 // ---------------------------------------------------------------------------
@@ -774,9 +919,14 @@ await test('a failed compaction pass delivers no pointer and leaves the next pas
   assert.equal(h.injected.length, 1, 'a later completed pass with the same id still delivers once')
 })
 
-await test('the pointer is not registered when it is switched off', async () => {
+await test('pointer: off suppresses the pointer and still arms the tools', async () => {
   const h = await harness({ config: { pointer: 'off' } })
-  assert.equal(h.listeners.get('session/event'), undefined)
+  const listener = h.listeners.get('session/event')[0]
+  listener({ id: SESSION_ID }, { type: 'compaction/summary', seq: 20, data: { compactionId: 'cmp-7', shadowedSeqs: [4], shadowedTokenCount: 10 } })
+  listener({ id: SESSION_ID }, { type: 'compaction/end', seq: 22, data: { compactionId: 'cmp-7', turn: null } })
+  await Promise.resolve()
+  assert.equal(h.injected.length, 0)
+  assert.deepEqual(h.registered.map(definition => definition.name), TOOL_NAMES)
 })
 
 await test('an unavailable agent and a throwing injection never escape the listener', async () => {
@@ -785,10 +935,17 @@ await test('an unavailable agent and a throwing injection never escape the liste
   const noAgent = silent.listeners.get('session/event')[0]
   noAgent({ id: SESSION_ID }, { type: 'compaction/summary', seq: 20, data: { compactionId: 'cmp-1', shadowedSeqs: [4], shadowedTokenCount: 1 } })
   noAgent({ id: SESSION_ID }, { type: 'compaction/end', seq: 22, data: { compactionId: 'cmp-1' } })
+  assert.deepEqual(silent.registered, [], 'a pass with no live agent arms nothing')
 
+  // The agent has its own context here, so the only warning left is the one the
+  // injection itself raises when the inbox is gone.
+  const injected = []
+  const disposed = callerAgent(injected)
+  disposed.inject = () => { throw new Error('agent disposed') }
   const throwing = fakeContext({
     service: fakeSessionQuery(LOG, 50),
-    agents: { get: () => ({ session: { id: SESSION_ID }, inject() { throw new Error('agent disposed') } }) },
+    agent: disposed,
+    agents: { get: () => disposed },
   })
   await apply(throwing.ctx, {})
   const failing = throwing.listeners.get('session/event')[0]
@@ -797,6 +954,7 @@ await test('an unavailable agent and a throwing injection never escape the liste
   await Promise.resolve()
   assert.equal(throwing.warnings.length, 1)
   assert.match(throwing.warnings[0], /the post-compaction pointer was not delivered: Error: agent disposed/)
+  assert.deepEqual(throwing.registered.map(definition => definition.name), TOOL_NAMES, 'a failed pointer still arms the tools')
 })
 
 await test('pointer text and its dedupe policy are usable without a host', async () => {
