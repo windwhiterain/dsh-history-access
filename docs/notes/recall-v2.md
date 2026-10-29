@@ -1,6 +1,6 @@
 # recall-v2: windowed, indexed history recall
 
-Status: implemented in `feat/recall-v2` (2026-10-29).
+Status: implemented and merged to `main` (2026-10-29).
 Supersedes the per-call `sessionQuery` data path and the fixed 8,000-character
 page of the first version.
 
@@ -107,6 +107,27 @@ Rejected alternatives:
 | reference: one deep clone of the log | ~950 ms |
 
 `node probe/probe.mjs`: 47 offline probes pass.
+
+## Live acceptance
+
+The implementation was accepted in the session that built it. After the merge,
+that session was compacted with `compact_context`: 162 events (~202k tokens)
+became checkpoint c1027, the host armed the three tools at `request/header`
+seq 1038 (a `change`), and delivered exactly one pointer at seq 1035. The
+calls below ran in the same host, measured as `tool/call` → `tool/result`:
+
+| call | arguments | result | latency |
+|---|---|---|---|
+| `history_outline` | none | 408 chars | 28 ms (includes the first fold of 1,027 events) |
+| `history_read` | `checkpoint: "c1027"` | 22,920 chars | 9 ms |
+| `history_read` | `cursor: "c1027@76@24000@120"` | 6,546 chars | 5 ms |
+| `history_read` | `checkpoint`, `view: "map"`, `events: 200` | 12,655 chars | 5 ms |
+| `history_search` | `query: "structuredClone"` | 5,755 chars | 6 ms |
+
+The map returned every navigation entry of the span in one page ("end of this
+range", 81 lines); the search found 9 matches across 277 scanned events, naming
+`c1027` for shadowed hits and `(visible)` for current ones. The same five calls
+under the old data path would have cost ~100 s of structure rebuilding alone.
 
 ## Invariants of the data path
 

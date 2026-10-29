@@ -189,7 +189,7 @@ A second probe replays a real session log through the same path and reports the 
 node probe/bench.mjs <session-log|sessions-root> [limit] [query]
 ```
 
-On a 59k-event session (204 MB decoded, 22 checkpoints, 1,964-event largest span) the first index fold takes ~10 ms, a subsequent call ~50 µs, `history_outline` ~2 ms, a 24k-char transcript page under 1 ms, a 24k-char span map under 1 ms, a whole-log literal search ~40 ms, and a full 1,964-position paging walk 21 pages / ~9 ms with no duplicated position. The same log takes ~950 ms for one deep clone, which is what a single `sessionQuery` structure read cost before this path.
+On a 59k-event session (204 MB decoded, 22 checkpoints, 1,964-event largest span) the first index fold takes ~10 ms, a subsequent call ~50 µs, `history_outline` ~2 ms, a 24k-char transcript page under 1 ms, a 24k-char span map under 1 ms, a whole-log literal search ~40 ms, and a full 1,964-position paging walk 21 pages / ~9 ms with no duplicated position. The same log takes ~950 ms for one deep clone, which is what a single `sessionQuery` structure read cost before this path. On the live host that produced this change, the five calls after a manual compaction (outline, a 24k page, a cursor page, a 200-line map, and a search) took 28, 9, 5, 5, and 6 ms.
 
 A third, read-only probe reports what a real session log proves, for acceptance runs against a live host:
 
