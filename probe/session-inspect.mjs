@@ -12,58 +12,11 @@
  * Usage: node probe/session-inspect.mjs <session-log|sessions-root> [limit]
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
-import { zstdDecompressSync } from 'node:zlib'
+import { statSync } from 'node:fs'
+import { eventOf, logsUnder, readLog, records } from './session-log.mjs'
 
 const TOOL_NAMES = ['history_outline', 'history_read', 'history_search']
 const POINTER_PREFIX = 'Context was condensed into checkpoint'
-
-/** Split one concatenated zstd stream into frames and decompress each. */
-function decompressFrames(buffer) {
-  const magic = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
-  const starts = []
-  let at = buffer.indexOf(magic)
-  while (at !== -1) {
-    starts.push(at)
-    at = buffer.indexOf(magic, at + 4)
-  }
-  const chunks = []
-  for (const [index, start] of starts.entries()) {
-    const end = starts[index + 1] ?? buffer.length
-    try {
-      chunks.push(zstdDecompressSync(buffer.subarray(start, end)))
-    } catch {
-      // A trailing partial frame (a write in flight) is simply not read.
-    }
-  }
-  return Buffer.concat(chunks).toString('utf8')
-}
-
-/** Read one session log as JSONL text, compressed or plain. */
-function readLog(path) {
-  const bytes = readFileSync(path)
-  return path.endsWith('.zstd') ? decompressFrames(bytes) : bytes.toString('utf8')
-}
-
-/** Session logs under a sessions root, newest first. */
-function logsUnder(root) {
-  const found = []
-  for (const project of readdirSync(root, { withFileTypes: true })) {
-    if (!project.isDirectory()) continue
-    const projectDir = join(root, project.name)
-    for (const session of readdirSync(projectDir, { withFileTypes: true })) {
-      if (!session.isDirectory()) continue
-      const dir = join(projectDir, session.name)
-      for (const file of readdirSync(dir)) {
-        if (!file.startsWith('session.v')) continue
-        const path = join(dir, file)
-        found.push({ path, time: statSync(path).mtimeMs })
-      }
-    }
-  }
-  return found.sort((left, right) => right.time - left.time).map(entry => entry.path)
-}
 
 /** Concatenated text of one message's content blocks. */
 function messageText(message) {
@@ -73,20 +26,6 @@ function messageText(message) {
     .filter(block => block?.type === 'text' && typeof block.text === 'string')
     .map(block => block.text)
     .join('\n')
-}
-
-/** Every record of one session log, tolerating blank and torn lines. */
-function records(text) {
-  const parsed = []
-  for (const line of text.split('\n')) {
-    if (line.trim() === '') continue
-    try {
-      parsed.push(JSON.parse(line))
-    } catch {
-      // A torn trailing line is not a record.
-    }
-  }
-  return parsed
 }
 
 /** Report the recall evidence carried by one session log. */
@@ -101,7 +40,7 @@ function inspect(path) {
   let armedAt
 
   for (const record of all) {
-    const event = record.event ?? record
+    const event = eventOf(record)
     const type = event.type
     if (typeof type !== 'string') continue
     counts.set(type, (counts.get(type) ?? 0) + 1)

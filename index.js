@@ -3,17 +3,16 @@
  *
  * A compaction pass replaces earlier conversation with a summary and leaves the
  * originals in the append-only session log. This plugin gives the model three
- * tools over that log — an outline, a paginated transcript read, and a literal
- * search — so recovering a condensed detail never requires shelling out to read
- * or decompress a session file. Every read is a pure function of the durable
- * log: no index, no embeddings, no second model call.
+ * tools over that log — an outline, a windowed transcript read (with a span-map
+ * view), and a literal search — so recovering a condensed detail never requires
+ * shelling out to read or decompress a session file.
  *
- * The plugin registers no session event type and stores nothing: out-of-tree
- * event types are refused by the session persistence reader, and
- * `compaction/summary` already records what each checkpoint replaced
- * (`packages/compaction/compaction/src/types.ts`). A post-compaction pointer
- * reaches the model through the documented injection channel
- * (`Agent.inject`, `packages/core/agent/src/runtime-types.ts`).
+ * The data path is the session projection service, not repeated queries: a
+ * registered unit with no wire view feeds each committed event reference to the
+ * plugin once (`lib/recall-index.js`), and the plugin advances its own derived
+ * index over the appended events on the next tool call. A recall tool therefore
+ * costs O(events appended since the previous call) rather than a whole-session
+ * deep clone, which is what made a chained read cost ~20 s per call.
  *
  * The three tools are registered LAZILY, so a session that has condensed
  * nothing spends no schema tokens on recall it cannot use. Registration lands
@@ -41,10 +40,27 @@
  * @module dsh-history-access
  */
 
-import { Config, normalizeConfig } from './lib/config.js'
+import { Config, MAX_SEARCH_CONTEXT, MIN_PAGE_CHARS, normalizeConfig } from './lib/config.js'
 import { createPointerDedupe, pointerText } from './lib/pointer.js'
-import { createQuery, QueryError } from './lib/query.js'
-import { decodeCursor, renderOutline, renderSearchPage, renderTranscriptPage, snippetOf } from './lib/render.js'
+import {
+  QueryError,
+  collectMap,
+  collectTranscript,
+  findCheckpoint,
+  remainingInRange,
+  resolveRead,
+  searchIn,
+} from './lib/query.js'
+import { FEED_KEY, createIndexReader, registerEventFeed, structureOf } from './lib/recall-index.js'
+import {
+  decodeCursor,
+  finishSpanMapPage,
+  finishTranscriptPage,
+  renderOutline,
+  renderSearchPage,
+  renderSpanMap,
+  renderTranscriptPage,
+} from './lib/render.js'
 
 export { Config }
 
@@ -55,8 +71,11 @@ export const name = 'history-access'
 const applied = new WeakSet()
 
 /** Canonical `history_read`/`history_search` parameter keys, in schema order. */
-const READ_ARGUMENTS = ['checkpoint', 'seq', 'cursor']
-const SEARCH_ARGUMENTS = ['query', 'checkpoint', 'limit']
+const READ_ARGUMENTS = ['checkpoint', 'seq', 'cursor', 'chars', 'events', 'view']
+const SEARCH_ARGUMENTS = ['query', 'checkpoint', 'limit', 'context']
+
+/** `history_read` views. */
+const VIEWS = Object.freeze(['transcript', 'map'])
 
 /**
  * Canonical tool output: the model-facing page text and nothing else.
@@ -75,9 +94,9 @@ const OUTPUT = Object.freeze({
 })
 
 /**
- * Resolve the calling agent's own session id, refusing a caller that has none.
+ * Resolve the calling agent, refusing a caller that has no live session.
  * @param exec - the tool execution context.
- * @returns the caller's session id.
+ * @returns the calling agent.
  * @throws {QueryError} when the call is not agent-bound.
  */
 function callerOf(exec) {
@@ -85,7 +104,7 @@ function callerOf(exec) {
   if (agent === undefined || agent.session === undefined) {
     throw new QueryError('history recall requires an agent-bound caller')
   }
-  return agent.session.id
+  return agent
 }
 
 /**
@@ -105,6 +124,26 @@ function stepCap(ctx, agent) {
     throw new QueryError('history recall requires an active step boundary in this session')
   }
   return start - 1
+}
+
+/**
+ * Resolve this session's feed and advance its derived index.
+ * @param ctx - the plugin context.
+ * @param reader - the per-session index reader.
+ * @param agent - the calling agent.
+ * @returns the feed's event array and the derived index.
+ * @throws {QueryError} when the deployment mounts no projection service.
+ */
+function recallState(ctx, reader, agent) {
+  const projections = ctx.get('sessionProjections')
+  if (projections === undefined) {
+    throw new QueryError('history recall is unavailable: this deployment mounts no session projection service')
+  }
+  const feed = projections.stateOf(agent.session, FEED_KEY)
+  if (feed === undefined) {
+    throw new QueryError('history recall is not indexed for this session yet')
+  }
+  return { events: feed.events, index: reader.read(agent.session, feed) }
 }
 
 /**
@@ -129,22 +168,45 @@ function argumentsOf(args, allowed, tool) {
 }
 
 /**
- * Normalize `history_read` arguments.
- * @param raw - the model's raw arguments.
- * @returns the checkpoint id, the start seq, or the continuation cursor — exactly one.
- * @throws {QueryError} when the caller supplied none or more than one.
+ * Clamp one integer budget into its range, remembering what the caller asked for.
+ * @param raw - the caller's value, or undefined for the default.
+ * @param fallback - the configured default.
+ * @param minimum - the smallest accepted value.
+ * @param maximum - the largest accepted value.
+ * @param tool - the tool name for the diagnostic.
+ * @param field - the argument name for the diagnostic.
+ * @returns the effective value and, when it was clamped, the requested one.
+ * @throws {QueryError} when the value is not an integer.
  */
-function readArguments(raw) {
+function budgetOf(raw, fallback, minimum, maximum, tool, field) {
+  if (raw === undefined) return { value: fallback, requested: undefined }
+  if (!Number.isInteger(raw)) {
+    throw new QueryError(`${tool} ${field} must be an integer`)
+  }
+  return { value: Math.min(maximum, Math.max(minimum, raw)), requested: raw }
+}
+
+/**
+ * Normalize `history_read` arguments.
+ *
+ * `checkpoint` and `seq` combine; a cursor carries its own range identity and
+ * therefore excludes both. Budgets clamp instead of failing, because a page
+ * that asked for more than the deployment allows still has a useful answer.
+ * @param raw - the model's raw arguments.
+ * @param config - the normalized row configuration.
+ * @returns the resolved selectors, view, and effective budgets.
+ * @throws {QueryError} when a selector is missing, repeated, or malformed.
+ */
+function readArguments(raw, config) {
   const args = argumentsOf(raw, READ_ARGUMENTS, 'history_read')
   const checkpoint = args.checkpoint === undefined ? null : args.checkpoint
   const seq = args.seq === undefined ? null : args.seq
   const cursor = args.cursor === undefined ? null : args.cursor
-  const supplied = [checkpoint, seq, cursor].filter(value => value !== null)
-  if (supplied.length === 0) {
-    throw new QueryError('history_read needs one of checkpoint (an id from history_outline), seq (an event position), or cursor (from a previous page)')
+  if (cursor !== null && (checkpoint !== null || seq !== null)) {
+    throw new QueryError('history_read cursor already carries its position; omit checkpoint and seq when continuing a page')
   }
-  if (supplied.length > 1) {
-    throw new QueryError('history_read takes exactly one of checkpoint, seq, or cursor')
+  if (cursor === null && checkpoint === null && seq === null) {
+    throw new QueryError('history_read needs checkpoint (an id from history_outline), seq (an event position), or cursor (from a previous page)')
   }
   if (checkpoint !== null && (typeof checkpoint !== 'string' || checkpoint.trim().length === 0)) {
     throw new QueryError('history_read checkpoint must be a checkpoint id such as "c245"')
@@ -152,20 +214,38 @@ function readArguments(raw) {
   if (seq !== null && (!Number.isInteger(seq) || seq < 0)) {
     throw new QueryError('history_read seq must be a non-negative integer event position')
   }
-  if (cursor !== null && (typeof cursor !== 'string' || decodeCursor(cursor) === null)) {
+  const carried = cursor === null ? undefined : decodeCursor(cursor)
+  if (cursor !== null && (typeof cursor !== 'string' || carried === null)) {
     throw new QueryError('history_read cursor must be the cursor line a previous page returned')
   }
-  return { checkpoint, seq, cursor }
+  // A cursor carries the budgets of the page it came from, so continuing a page
+  // keeps its size instead of silently growing to the deployment default.
+  const chars = budgetOf(args.chars, carried?.chars ?? config.readDefaultChars, MIN_PAGE_CHARS, config.readMaxChars, 'history_read', 'chars')
+  const events = budgetOf(args.events, carried?.events ?? config.readDefaultEvents, 1, config.readMaxEvents, 'history_read', 'events')
+  const view = args.view === undefined ? 'transcript' : args.view
+  if (!VIEWS.includes(view)) {
+    throw new QueryError(`history_read view must be ${VIEWS.map(value => `"${value}"`).join(' or ')}`)
+  }
+  return {
+    checkpoint,
+    seq,
+    cursor,
+    chars: chars.value,
+    charsRequested: chars.requested,
+    events: events.value,
+    eventsRequested: events.requested,
+    view,
+  }
 }
 
 /**
  * Normalize `history_search` arguments.
  * @param raw - the model's raw arguments.
- * @param maxHits - the configured hit ceiling.
- * @returns the literal query, the optional checkpoint id, and the hit limit.
- * @throws {QueryError} when the query is missing or the limit is out of range.
+ * @param config - the normalized row configuration.
+ * @returns the literal query, the optional checkpoint id, and the effective bounds.
+ * @throws {QueryError} when the query is missing or malformed.
  */
-function searchArguments(raw, maxHits) {
+function searchArguments(raw, config) {
   const args = argumentsOf(raw, SEARCH_ARGUMENTS, 'history_search')
   if (typeof args.query !== 'string' || args.query.trim().length === 0) {
     throw new QueryError('history_search needs a non-empty literal query')
@@ -174,84 +254,52 @@ function searchArguments(raw, maxHits) {
   if (checkpoint !== null && (typeof checkpoint !== 'string' || checkpoint.trim().length === 0)) {
     throw new QueryError('history_search checkpoint must be a checkpoint id such as "c245"')
   }
-  const limit = args.limit === undefined ? maxHits : args.limit
-  if (!Number.isInteger(limit) || limit < 1 || limit > maxHits) {
-    throw new QueryError(`history_search limit must be an integer between 1 and ${maxHits}`)
-  }
-  return { query: args.query.trim(), checkpoint, limit }
-}
-
-/**
- * Find one checkpoint by the id `history_outline` reported.
- * @param structure - the session structure map.
- * @param requested - the id the model passed, with or without its `c` prefix.
- * @returns the checkpoint.
- * @throws {QueryError} listing every id that does exist.
- */
-function findCheckpoint(structure, requested) {
-  const wanted = String(requested).trim().replace(/^[cC]/u, '')
-  const checkpoint = structure.checkpoints.find(entry => entry.summarySeq === Number(wanted))
-  if (checkpoint === undefined) {
-    const known = structure.checkpoints.length === 0
-      ? 'this session has no compaction checkpoints'
-      : `this session has ${structure.checkpoints.map(entry => entry.id).join(', ')}`
-    throw new QueryError(`unknown checkpoint "${requested}" — ${known}`)
-  }
-  return checkpoint
-}
-
-/** Describe one checkpoint to the transcript renderer. */
-function checkpointTarget(checkpoint) {
-  return {
-    kind: 'checkpoint',
-    ref: checkpoint.id,
-    id: checkpoint.id,
-    startSeq: checkpoint.startSeq,
-    endSeq: checkpoint.endSeq,
-    eventCount: checkpoint.shadowedSeqs.length,
-    shadowedTokenCount: checkpoint.shadowedTokenCount,
-    superseded: checkpoint.superseded,
-  }
+  const limit = budgetOf(args.limit, config.searchMaxHits, 1, config.searchMaxHits, 'history_search', 'limit')
+  const context = budgetOf(args.context, config.searchDefaultContext, 80, MAX_SEARCH_CONTEXT, 'history_search', 'context')
+  return { query: args.query.trim(), checkpoint, limit: limit.value, context: context.value }
 }
 
 /** The model-facing description of `history_outline`. */
 const OUTLINE_DESCRIPTION = 'Map this session\'s own history: how many events it holds, every compaction '
   + 'checkpoint with the id, seq range, size, and short summary of the span it replaced, and the turn list with '
   + 'each turn\'s seq range and first request. Call it when a summary may have dropped something you need, or '
-  + 'before a long read: the checkpoint ids it reports are the ids history_read and history_search take.'
+  + 'before a long read: the checkpoint ids it reports are the ids history_read takes, and history_read with '
+  + 'view "map" lists the events inside one.'
 
 /** The model-facing description of `history_read`. */
 const READ_DESCRIPTION = 'Read this session\'s own earlier history as a role-labeled transcript (User:, Assistant:, '
-  + 'Tool result:). Pass a checkpoint id from history_outline to read the exact span that checkpoint replaced, or a '
-  + 'seq to read forward from that position; a page ends with a cursor that reads the next page. Text is condensed '
-  + 'only when a page is cut, and every cut is marked. This is the supported way to recover what a compaction '
-  + 'summary replaced — do not read or decompress session files to get history back.'
+  + 'Tool result:). Pass a checkpoint id from history_outline to read the span that checkpoint replaced, a seq to '
+  + 'read forward from a position, or both together to start inside that span. A page stops at the chars and events '
+  + 'budgets and ends with a cursor that continues it; asking for a larger chars (up to the maximum named on the '
+  + 'argument) fetches a whole region in one call instead of chaining small pages. Pass view "map" for a '
+  + 'one-line-per-event index of the range, which is how you find where in a large span to read. This is the '
+  + 'supported way to recover what a compaction summary replaced — do not read or decompress session files.'
 
 /** The model-facing description of `history_search`. */
 const SEARCH_DESCRIPTION = 'Find a literal, case-insensitive phrase anywhere in this session\'s own history, '
   + 'including history that compaction has already condensed. Returns each matching event position with the '
-  + 'checkpoint that owns it and a snippet around the match, plus how much was scanned. Use it when you remember a '
-  + 'distinctive string, path, error, or identifier but not where it appeared; use history_read to read the '
-  + 'surrounding text. This is the supported way to find condensed detail without reading or decompressing '
+  + 'checkpoint that owns it, its role, and a snippet around the match, plus how much was scanned. Use it when you '
+  + 'remember a distinctive string, path, error, or identifier but not where it appeared; use history_read to read '
+  + 'the surrounding text. This is the supported way to find condensed detail without reading or decompressing '
   + 'session files.'
 
 /** The `history_outline` tool definition. */
-function outlineDefinition(config, query) {
+function outlineDefinition(ctx, config, reader) {
   return {
     name: 'history_outline',
     description: OUTLINE_DESCRIPTION,
     parameters: { type: 'object', additionalProperties: false, properties: {} },
     output: OUTPUT,
     async execute(_args, exec) {
-      const sessionId = callerOf(exec)
-      const structure = await query.structure(sessionId, exec.signal)
-      return { text: renderOutline(structure, config.outlineMaxChars) }
+      const agent = callerOf(exec)
+      const { events, index } = recallState(ctx, reader, agent)
+      return { text: renderOutline(structureOf(index, events), config.outlineMaxChars) }
     },
   }
 }
 
 /** The `history_read` tool definition. */
-function readDefinition(ctx, config, query) {
+function readDefinition(ctx, config, reader) {
   return {
     name: 'history_read',
     description: READ_DESCRIPTION,
@@ -261,75 +309,65 @@ function readDefinition(ctx, config, query) {
       properties: {
         checkpoint: {
           type: 'string',
-          description: 'Checkpoint id reported by history_outline, such as "c245"; reads the span that checkpoint replaced.',
+          description: 'Checkpoint id reported by history_outline, such as "c245"; restricts the read to the span that checkpoint replaced.',
         },
         seq: {
           type: 'integer',
-          description: 'Event seq to read forward from, such as one reported by history_outline or history_search.',
+          description: 'Event seq to start at, such as one reported by history_outline or history_search; combine with checkpoint to start inside that span.',
         },
         cursor: {
           type: 'string',
-          description: 'Cursor line a previous history_read page ended with; reads the next page.',
+          description: 'Cursor line a previous page ended with; continues that page. Carries its own position, so it cannot combine with checkpoint or seq.',
+        },
+        chars: {
+          type: 'integer',
+          description: `Page budget in characters (${MIN_PAGE_CHARS} to ${config.readMaxChars}, default ${config.readDefaultChars}); a larger page is cheaper than many small ones.`,
+        },
+        events: {
+          type: 'integer',
+          description: `Page budget in events (1 to ${config.readMaxEvents}, default ${config.readDefaultEvents}); in map view it bounds lines.`,
+        },
+        view: {
+          type: 'string',
+          enum: [...VIEWS],
+          description: '"transcript" (default) renders the text; "map" lists one line per event with its role, size, and preview to find where to read.',
         },
       },
       required: [],
     },
     output: OUTPUT,
     async execute(args, exec) {
-      const sessionId = callerOf(exec)
-      const input = readArguments(args)
-      const structure = await query.structure(sessionId, exec.signal)
-      const cap = stepCap(ctx, exec.agent)
-      let target
-      let range
-      let resumeSeq
-      if (input.cursor !== null) {
-        const decoded = decodeCursor(input.cursor)
-        resumeSeq = decoded.nextSeq
-        if (decoded.ref.startsWith('c')) {
-          const checkpoint = findCheckpoint(structure, decoded.ref.slice(1))
-          target = checkpointTarget(checkpoint)
-          range = { fromSeq: checkpoint.startSeq, toSeq: checkpoint.endSeq, seqs: new Set(checkpoint.shadowedSeqs) }
-        } else {
-          const from = Number(decoded.ref.slice(1))
-          target = { kind: 'seq', ref: `s${from}`, seq: from, firstSeq: structure.firstSeq, lastSeq: structure.lastSeq }
-          range = { fromSeq: from, toSeq: Math.min(structure.lastSeq, cap), seqs: undefined }
-        }
-      } else if (input.checkpoint !== null) {
-        const checkpoint = findCheckpoint(structure, input.checkpoint)
-        target = checkpointTarget(checkpoint)
-        range = { fromSeq: checkpoint.startSeq, toSeq: checkpoint.endSeq, seqs: new Set(checkpoint.shadowedSeqs) }
-        resumeSeq = checkpoint.startSeq
-      } else {
-        if (input.seq > structure.lastSeq) {
-          throw new QueryError(`seq ${input.seq} is past the end of this session, whose last recorded seq is ${structure.lastSeq}`)
-        }
-        target = { kind: 'seq', ref: `s${input.seq}`, seq: input.seq, firstSeq: structure.firstSeq, lastSeq: structure.lastSeq }
-        range = { fromSeq: input.seq, toSeq: Math.min(structure.lastSeq, cap), seqs: undefined }
-        resumeSeq = input.seq
+      const agent = callerOf(exec)
+      const input = readArguments(args, config)
+      const { events, index } = recallState(ctx, reader, agent)
+      const cap = stepCap(ctx, agent)
+      const { target, range, resumeSeq } = resolveRead(input, index, events, cap)
+      const collected = input.view === 'map'
+        ? collectMap(events, range, resumeSeq, input.events)
+        : collectTranscript(events, range, resumeSeq, input.events)
+      const pageInput = {
+        target,
+        events: collected.events,
+        maxEvents: input.events,
+        maxChars: input.chars,
+        moreBeyondBuffer: collected.moreBeyondBuffer,
       }
-      if (range.toSeq < range.fromSeq) {
-        throw new QueryError(
-          `seqs ${range.fromSeq} and later belong to the step that is running now; history_read reads history `
-          + `recorded before this step, up to seq ${cap}`,
-        )
+      const page = input.view === 'map' ? renderSpanMap(pageInput) : renderTranscriptPage(pageInput)
+      const remaining = page.cutSeq === null ? 0 : remainingInRange(range, page.cutSeq)
+      const budgets = {
+        chars: input.chars,
+        charsRequested: input.charsRequested,
+        events: input.events,
+        eventsRequested: input.eventsRequested,
       }
-      const page = await query.readPage(sessionId, range, resumeSeq, config.readMaxEvents, exec.signal)
-      return {
-        text: renderTranscriptPage({
-          target,
-          events: page.events,
-          maxEvents: config.readMaxEvents,
-          maxChars: config.readMaxChars,
-          moreBeyondBuffer: page.moreBeyondBuffer,
-        }).text,
-      }
+      const finish = input.view === 'map' ? finishSpanMapPage : finishTranscriptPage
+      return { text: finish({ page, remaining, budgets }) }
     },
   }
 }
 
 /** The `history_search` tool definition. */
-function searchDefinition(ctx, config, query) {
+function searchDefinition(ctx, config, reader) {
   return {
     name: 'history_search',
     description: SEARCH_DESCRIPTION,
@@ -348,24 +386,28 @@ function searchDefinition(ctx, config, query) {
         },
         limit: {
           type: 'integer',
-          description: `Maximum number of matches to report (1 to ${config.searchMaxHits}).`,
+          description: `Maximum number of matches to report (1 to ${config.searchMaxHits}); larger values are capped.`,
+        },
+        context: {
+          type: 'integer',
+          description: `Snippet width in characters around each match (80 to ${MAX_SEARCH_CONTEXT}, default ${config.searchDefaultContext}).`,
         },
       },
     },
     output: OUTPUT,
     async execute(args, exec) {
-      const sessionId = callerOf(exec)
-      const input = searchArguments(args, config.searchMaxHits)
-      const structure = await query.structure(sessionId, exec.signal)
-      const cap = stepCap(ctx, exec.agent)
-      let fromSeq = structure.firstSeq
-      let toSeq = Math.min(structure.lastSeq, cap)
+      const agent = callerOf(exec)
+      const input = searchArguments(args, config)
+      const { events, index } = recallState(ctx, reader, agent)
+      const cap = stepCap(ctx, agent)
+      let fromSeq = 0
+      let toSeq = Math.min(events.length - 1, cap)
       let seqs
       if (input.checkpoint !== null) {
-        const checkpoint = findCheckpoint(structure, input.checkpoint)
+        const checkpoint = findCheckpoint(index, input.checkpoint)
         fromSeq = checkpoint.startSeq
         toSeq = Math.min(checkpoint.endSeq, cap)
-        seqs = new Set(checkpoint.shadowedSeqs)
+        seqs = checkpoint.seqs
       }
       if (toSeq < fromSeq) {
         return {
@@ -379,27 +421,21 @@ function searchDefinition(ctx, config, query) {
           }),
         }
       }
-      const result = await query.search(sessionId, {
+      const result = searchIn(index, events, {
         query: input.query,
         fromSeq,
         toSeq,
         seqs,
         limit: input.limit,
-      }, exec.signal)
-      const hits = result.documents.map(document => ({
-        seq: document.seq,
-        surface: document.surface === 'current' ? 'visible' : document.surface,
-        owner: structure.shadowedOwner.get(document.seq) ?? (document.surface === 'current' ? '(visible)' : '(shadowed)'),
-        time: document.time,
-        snippet: snippetOf(document.text, input.query),
-      }))
+        context: input.context,
+      })
       return {
         text: renderSearchPage({
           query: input.query,
-          hits,
+          hits: result.hits,
           scanned: result.scanned,
           matched: result.matched,
-          truncated: result.matched > hits.length,
+          truncated: result.matched > result.hits.length,
           hitLimit: config.searchMaxHits,
         }),
       }
@@ -414,14 +450,14 @@ function searchDefinition(ctx, config, query) {
  * `history_read`'s step boundary is resolved through that agent's own context.
  * @param ctx - the registering agent's context.
  * @param config - the normalized row configuration.
- * @param query - the shared read facade.
+ * @param reader - the per-session index reader.
  * @returns the three definitions, in canonical order.
  */
-function recallTools(ctx, config, query) {
+function recallTools(ctx, config, reader) {
   return [
-    outlineDefinition(config, query),
-    readDefinition(ctx, config, query),
-    searchDefinition(ctx, config, query),
+    outlineDefinition(ctx, config, reader),
+    readDefinition(ctx, config, reader),
+    searchDefinition(ctx, config, reader),
   ]
 }
 
@@ -435,10 +471,10 @@ function recallTools(ctx, config, query) {
  * second compaction pass, a repeated `agent/created`, or a reload must not.
  * @param ctx - the plugin context, for diagnostics and the read facade.
  * @param config - the normalized row configuration.
- * @param query - the shared read facade.
+ * @param reader - the per-session index reader.
  * @param agent - the agent whose scope receives the tools.
  */
-function registerRecallTools(ctx, config, query, agent) {
+function registerRecallTools(ctx, config, reader, agent) {
   const tools = agent.ctx?.tools
   if (tools === undefined) {
     // The deployment mounts no tool registry; there is nothing to register into
@@ -446,31 +482,10 @@ function registerRecallTools(ctx, config, query, agent) {
     ctx.logger?.warn?.('history-access: no tool registry is mounted, so the recall tools stay unregistered')
     return
   }
-  for (const definition of recallTools(agent.ctx, config, query)) {
+  for (const definition of recallTools(agent.ctx, config, reader)) {
     if (tools.get(definition.name, agent) !== undefined) continue
     tools.register(definition)
   }
-}
-
-/**
- * Find a checkpoint sequence to name the pointer of a session this plugin
- * joined late.
- *
- * The live log is indexed by log position, and `SessionSeq` is that position
- * (`packages/core/session/src/index.ts` `append`), so a summary event's index is
- * the seq the `c<summarySeq>` checkpoint id is built from.
- * @param session - the session to inspect.
- * @returns the first recorded checkpoint's seq, or undefined when it has none.
- */
-function firstCheckpointSeq(session) {
-  const events = session.snapshotEvents?.()
-  if (!Array.isArray(events)) return undefined
-  for (const [index, event] of events.entries()) {
-    if (event.type !== 'compaction/summary') continue
-    if (Number.isInteger(event.seq)) return event.seq
-    return index
-  }
-  return undefined
 }
 
 /**
@@ -480,19 +495,22 @@ function firstCheckpointSeq(session) {
  * A resume starts from a log whose earlier turns were already replaced by
  * checkpoints, so waiting for the next compaction would leave recall
  * unavailable for a session that may never compact again. The check reads the
- * live log this plugin already holds — one pass over the in-memory event list,
- * no service call — and a resumed session has already paid to load that log.
+ * feed's derived index, which the projection service folds from the in-memory
+ * log the resume already loaded.
  * @param ctx - the plugin context.
  * @param config - the normalized row configuration.
- * @param query - the shared read facade.
+ * @param reader - the per-session index reader.
  * @returns the `agent/created` listener.
  */
-function creationListener(ctx, config, query) {
+function creationListener(ctx, config, reader) {
   return ({ agent }) => {
     if (agent?.session === undefined) return
-    if (firstCheckpointSeq(agent.session) === undefined) return
     try {
-      registerRecallTools(ctx, config, query, agent)
+      const projections = ctx.get('sessionProjections')
+      const feed = projections?.stateOf(agent.session, FEED_KEY)
+      if (feed === undefined) return
+      if (reader.read(agent.session, feed).checkpoints.length === 0) return
+      registerRecallTools(ctx, config, reader, agent)
     } catch (error) {
       ctx.logger?.warn?.(`history-access: the recall tools were not registered: ${String(error)}`)
     }
@@ -515,11 +533,11 @@ function creationListener(ctx, config, query) {
  * A pass that reported an `error` condensed nothing and arms nothing.
  * @param ctx - the plugin context.
  * @param config - the normalized row configuration.
- * @param query - the shared read facade.
+ * @param reader - the per-session index reader.
  * @param dedupe - the per-compaction pointer delivery policy.
  * @returns the `session/event` listener.
  */
-function pointerListener(ctx, config, query, dedupe) {
+function pointerListener(ctx, config, reader, dedupe) {
   /** Session id -> compaction id -> the completed checkpoint's pointer facts. */
   const pending = new Map()
   return (session, event) => {
@@ -549,7 +567,7 @@ function pointerListener(ctx, config, query, dedupe) {
     // checkpoint.
     if (agent !== undefined) {
       try {
-        registerRecallTools(ctx, config, query, agent)
+        registerRecallTools(ctx, config, reader, agent)
       } catch (error) {
         ctx.logger?.warn?.(`history-access: the recall tools were not registered: ${String(error)}`)
       }
@@ -582,12 +600,12 @@ function pointerListener(ctx, config, query, dedupe) {
 }
 
 /**
- * Mount this plugin's lazy tool registration and its post-compaction pointer.
+ * Mount this plugin's event feed, lazy tool registration, and post-compaction pointer.
  *
- * Nothing is registered at apply time: a session that has condensed nothing
- * pays no schema tokens for recall it cannot use. See the module comment for
- * the two moments that do register, and why a mid-session addition is carried
- * by the loop rather than special-cased here.
+ * Nothing is registered at apply time except the projection feed: a session
+ * that has condensed nothing pays no schema tokens for recall it cannot use,
+ * and the feed is what makes the first recall call cheap. See the module
+ * comment for the two moments that do register tools.
  * @param ctx - the plugin context.
  * @param rawConfig - the row's configuration, validated here and by {@link Config}.
  */
@@ -596,10 +614,18 @@ export async function apply(ctx, rawConfig) {
   if (applied.has(owner)) return
   applied.add(owner)
   const config = normalizeConfig(rawConfig)
-  const query = createQuery(ctx)
+  const reader = createIndexReader()
+  const projections = ctx.get('sessionProjections')
+  if (projections === undefined) {
+    // Without the projection service there is no feed to fold and no recall to
+    // serve; the tools stay unregistered rather than failing on every call.
+    ctx.logger?.warn?.('history-access: no sessionProjections service is mounted, so the recall tools stay unregistered')
+  } else {
+    ctx.effect(() => registerEventFeed(projections), 'history-access: event feed')
+  }
   // Global listeners: this plugin is commonly mounted once at the root, and a
   // row placed inside a preset's plugin list would otherwise see only that
   // preset's agents — missing every session it is supposed to serve.
-  ctx.on('agent/created', creationListener(ctx, config, query), { global: true })
-  ctx.on('session/event', pointerListener(ctx, config, query, createPointerDedupe()), { global: true })
+  ctx.on('agent/created', creationListener(ctx, config, reader), { global: true })
+  ctx.on('session/event', pointerListener(ctx, config, reader, createPointerDedupe()), { global: true })
 }
